@@ -1,0 +1,27 @@
+{
+  "working_directory": "/Users/you/mailpilot",
+  "slack_channel_id": "C0123456789",
+  "slack_allowed_user_id": "U0123456789",
+  "slack_bot_token_env": "SLACK_BOT_TOKEN",
+  "claude_command": "/Users/you/.local/bin/claude",
+  "owner_name": "Your Name",
+  "gmail_query": "in:inbox is:unread -from:me",
+  "allowed_forwarders": [
+    "you@example.com"
+  ],
+  "mark_unauthorized_read": true,
+  "assistant_signature": "AI assistant\non behalf of Your Name",
+  "style_profile": "Direct, friendly, concise, professional. No invented commitments, dates, prices, facts, or decisions. Clear next steps.",
+  "default_mode": "Freigabe in Slack",
+  "blocked_send_keywords": [
+    "vertrag",
+    "kündigung",
+    "anwalt",
+    "rechtlich",
+    "rechnung",
+    "zahlung",
+    "konto",
+    "medizin",
+    "gesundheit"
+  ]
+}

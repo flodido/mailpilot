@@ -1,0 +1,16 @@
+.DS_Store
+__pycache__/
+*.pyc
+
+.venv/
+.env
+
+# Local secrets
+config.json
+credentials.json
+token.json
+
+# Runtime state
+state.json
+*.log
+*.lock
