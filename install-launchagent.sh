@@ -23,12 +23,11 @@ cat > "$PLIST" <<EOF
     <array>
         <string>$PYTHON</string>
         <string>$DIR/email_assistant.py</string>
-        <string>--once</string>
     </array>
     <key>WorkingDirectory</key>
     <string>$DIR</string>
-    <key>StartInterval</key>
-    <integer>120</integer>
+    <key>KeepAlive</key>
+    <true/>
     <key>RunAtLoad</key>
     <true/>
     <key>StandardOutPath</key>

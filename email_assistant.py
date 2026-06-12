@@ -7,11 +7,13 @@ import argparse
 import base64
 import fcntl
 import html
+import http.server
 import json
 import os
 import re
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -172,6 +174,20 @@ def slack_api(token: str, method: str, payload: dict[str, Any] | None = None) ->
     return result
 
 
+def slack_history(token: str, channel: str, limit: int = 15, oldest: str | None = None) -> list[dict[str, Any]]:
+    params: dict[str, Any] = {"channel": channel, "limit": limit}
+    if oldest:
+        params["oldest"] = oldest
+    query = urllib.parse.urlencode(params)
+    url = f"https://slack.com/api/conversations.history?{query}"
+    request = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
+    with urllib.request.urlopen(request, timeout=30) as response:
+        result = json.loads(response.read().decode("utf-8"))
+    if not result.get("ok"):
+        raise RuntimeError(f"Slack API error in conversations.history: {result}")
+    return result.get("messages", [])
+
+
 def slack_replies(token: str, channel: str, thread_ts: str) -> list[dict[str, Any]]:
     query = urllib.parse.urlencode({"channel": channel, "ts": thread_ts, "limit": 100})
     url = f"https://slack.com/api/conversations.replies?{query}"
@@ -263,10 +279,12 @@ def gmail_mark_read(service: Any, message_id: str) -> None:
     ).execute()
 
 
-def gmail_send(service: Any, to_addr: str, subject: str, body: str) -> dict[str, Any]:
+def gmail_send(service: Any, to_addr: str, subject: str, body: str, cc: str | None = None) -> dict[str, Any]:
     message = EmailMessage()
     message["To"] = to_addr
     message["Subject"] = ensure_reply_subject(subject)
+    if cc:
+        message["Cc"] = cc
     message.set_content(body)
     raw = base64.urlsafe_b64encode(message.as_bytes()).decode("utf-8")
     return service.users().messages().send(userId="me", body={"raw": raw}).execute()
@@ -604,6 +622,77 @@ def strip_meta_trailer(draft: str, signature: str) -> str:
     return "\n\n".join(paragraphs).strip()
 
 
+TO_TAG_RE = re.compile(r"<to>(.*?)</to>", re.DOTALL | re.IGNORECASE)
+SUBJECT_TAG_RE = re.compile(r"<subject>(.*?)</subject>", re.DOTALL | re.IGNORECASE)
+
+
+def claude_draft_new_email(
+    config: dict[str, Any],
+    instruction: str,
+    previous_draft: dict[str, str] | None = None,
+    refinement: str | None = None,
+) -> dict[str, str]:
+    command = config["claude_command"]
+    owner_name = config.get("owner_name", "the user")
+    signature = config.get("assistant_signature", "AI assistant")
+    style_profile = config.get("style_profile", "")
+
+    prompt = f"""
+Du bist die KI-Assistenz von {owner_name} und schreibst eine neue ausgehende E-Mail.
+
+Harte Regeln:
+- Antworte ausschließlich in diesem Format, keine weiteren Erklärungen:
+<to>empfaenger@email.de</to>
+<subject>Betreff der E-Mail</subject>
+<email_body>
+E-Mail-Inhalt hier
+
+{signature}
+</email_body>
+- Erfinde keine Fakten, Termine, Preise oder Zusagen.
+- Schreibe in der Sprache, die der Anweisung entspricht.
+
+Standardstil:
+{style_profile}
+
+Anweisung:
+{instruction}
+""".strip()
+
+    if previous_draft and refinement:
+        prompt += f"""
+
+Bisheriger Entwurf (An: {previous_draft.get("to", "")}, Betreff: {previous_draft.get("subject", "")}):
+{previous_draft.get("body", "")}
+
+Neue Verfeinerung: {refinement}
+
+Erstelle eine neue Version im selben Format.
+""".rstrip()
+
+    result = subprocess.run(
+        [command, "--print", prompt],
+        cwd=config.get("working_directory") or config.get("vault_path") or str(ROOT),
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=180,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"Claude failed: {result.stderr.strip() or result.stdout.strip()}")
+
+    output = result.stdout.strip()
+    to_match = TO_TAG_RE.search(output)
+    subject_match = SUBJECT_TAG_RE.search(output)
+    body_match = EMAIL_BODY_TAG_RE.search(output)
+    return {
+        "to": to_match.group(1).strip() if to_match else "",
+        "subject": subject_match.group(1).strip() if subject_match else "",
+        "body": body_match.group(1).strip() if body_match else output,
+    }
+
+
 def final_draft(config: dict[str, Any], mail: ForwardedMail, draft: str) -> str:
     signature = config.get("assistant_signature", "AI assistant")
     cleaned = sanitize_draft(draft, mail.instructions, signature)
@@ -798,6 +887,174 @@ def handle_slack_reply(
         log(f"Refined draft for Gmail message {message_id}.")
 
 
+def process_slack_commands(
+    service: Any,
+    token: str,
+    config: dict[str, Any],
+    state: dict[str, Any],
+) -> None:
+    allowed_user = config["slack_allowed_user_id"]
+    channel = config["slack_channel_id"]
+    commands = state.setdefault("slack_cmd", {})
+    oldest = state.get("slack_cmd_last_ts")
+
+    messages = slack_history(token, channel, limit=15, oldest=oldest)
+    newest_ts: str | None = None
+
+    for msg in reversed(messages):
+        ts = msg.get("ts", "")
+        if not ts:
+            continue
+        if msg.get("bot_id"):
+            continue
+        if msg.get("thread_ts") and msg["thread_ts"] != ts:
+            continue
+        if msg.get("user") != allowed_user:
+            continue
+        if ts in commands:
+            continue
+
+        text = normalize_slack_text(msg.get("text", "")).strip()
+        if not text:
+            continue
+
+        newest_ts = ts
+        try:
+            result = claude_draft_new_email(config, text)
+            to_addr = result["to"]
+            subject = result["subject"]
+            draft = result["body"]
+
+            if not to_addr:
+                slack_post(token, channel,
+                    "Ich konnte keinen Empfänger erkennen. Bitte gib eine E-Mail-Adresse an.", ts)
+                commands[ts] = {"status": "error", "error": "no_recipient", "created_at": time.time()}
+                continue
+
+            slack_post(
+                token, channel,
+                f"Entwurf:\n*An:* `{to_addr}`\n*Betreff:* {subject}\n\n```{draft}```\n\n"
+                f"Reagiere mit :white_check_mark: zum Senden, :memo: für Gmail-Entwurf, "
+                f":x: zum Ablehnen. Für Änderungen im Thread antworten.",
+                ts,
+            )
+            commands[ts] = {
+                "status": "pending",
+                "slack_ts": ts,
+                "slack_channel_id": channel,
+                "to": to_addr,
+                "subject": subject,
+                "draft": draft,
+                "last_reply_ts": ts,
+                "created_at": time.time(),
+            }
+            log(f"Slack-Befehl {ts}: Entwurf für {to_addr} erstellt.")
+        except Exception as exc:
+            commands[ts] = {"status": "error", "error": str(exc), "created_at": time.time()}
+            log(f"Fehler bei Slack-Befehl {ts}: {exc}")
+
+    if newest_ts:
+        state["slack_cmd_last_ts"] = newest_ts
+
+
+def process_slack_cmd_approvals(
+    service: Any,
+    token: str,
+    config: dict[str, Any],
+    state: dict[str, Any],
+) -> None:
+    allowed_user = config["slack_allowed_user_id"]
+    commands = state.get("slack_cmd", {})
+
+    for cmd_ts, record in list(commands.items()):
+        if record.get("status") != "pending":
+            continue
+        thread_ts = record.get("slack_ts")
+        channel = record.get("slack_channel_id") or config["slack_channel_id"]
+        if not thread_ts:
+            continue
+
+        try:
+            messages = slack_replies(token, channel, thread_ts)
+        except RuntimeError as exc:
+            if "thread_not_found" in str(exc):
+                continue
+            raise
+
+        if messages:
+            command = slack_reaction_command(messages[0], allowed_user)
+            if command:
+                _handle_cmd_reply(service, token, config, record, command, thread_ts, channel)
+                continue
+
+        last_seen = float(record.get("last_reply_ts") or thread_ts)
+        user_replies = [
+            msg for msg in messages
+            if msg.get("user") == allowed_user
+            and not msg.get("bot_id")
+            and float(msg.get("ts", "0")) > last_seen
+        ]
+        for reply in sorted(user_replies, key=lambda m: float(m["ts"])):
+            text = normalize_slack_text(reply.get("text", ""))
+            record["last_reply_ts"] = reply["ts"]
+            _handle_cmd_reply(service, token, config, record, text, thread_ts, channel)
+
+
+def _handle_cmd_reply(
+    service: Any,
+    token: str,
+    config: dict[str, Any],
+    record: dict[str, Any],
+    text: str,
+    thread_ts: str,
+    channel: str,
+) -> None:
+    command = text.lower().strip()
+    to_addr = record.get("to", "")
+    subject = record.get("subject", "")
+    draft = record.get("draft", "")
+
+    if command in {"senden", "send"}:
+        cc = config.get("slack_cmd_cc")
+        gmail_send(service, to_addr, subject, draft, cc=cc)
+        record["status"] = "sent"
+        record["sent_at"] = time.time()
+        cc_info = f", CC: `{cc}`" if cc else ""
+        slack_post(token, channel, f"Gesendet an `{to_addr}`{cc_info}.", thread_ts)
+        log(f"Slack-Befehl: E-Mail gesendet an {to_addr}{cc_info}.")
+        return
+
+    if command in {"entwurf", "draft"}:
+        result = gmail_create_draft(service, to_addr, subject, draft)
+        record["status"] = "drafted"
+        record["gmail_draft_id"] = result.get("id")
+        record["drafted_at"] = time.time()
+        slack_post(token, channel, f"Gmail-Entwurf erstellt für `{to_addr}`.", thread_ts)
+        log(f"Slack-Befehl: Gmail-Entwurf für {to_addr} erstellt.")
+        return
+
+    if command in {"ablehnen", "reject", "verwerfen"}:
+        record["status"] = "rejected"
+        record["rejected_at"] = time.time()
+        slack_post(token, channel, "Verworfen. Ich sende nichts.", thread_ts)
+        return
+
+    if text:
+        prev = {"to": to_addr, "subject": subject, "body": draft}
+        result = claude_draft_new_email(config, record.get("original_instruction", text),
+                                        previous_draft=prev, refinement=text)
+        record["to"] = result["to"] or to_addr
+        record["subject"] = result["subject"] or subject
+        record["draft"] = result["body"]
+        slack_post(
+            token, channel,
+            f"Neue Version:\n*An:* `{record['to']}`\n*Betreff:* {record['subject']}\n\n"
+            f"```{record['draft']}```\n\nReagiere mit :white_check_mark:/:memo:/:x: oder antworte für weitere Änderungen.",
+            thread_ts,
+        )
+        log(f"Slack-Befehl: Entwurf verfeinert.")
+
+
 def run_once() -> None:
     with single_instance() as acquired:
         if not acquired:
@@ -809,7 +1066,41 @@ def run_once() -> None:
 
         process_new_gmail(service, token, config, state)
         process_slack_approvals(service, token, config, state)
+        process_slack_commands(service, token, config, state)
+        process_slack_cmd_approvals(service, token, config, state)
         save_json(STATE_PATH, state)
+
+
+WEBHOOK_PORT = 9878
+_trigger = threading.Event()
+
+
+class _WebhookHandler(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        if self.path == "/trigger":
+            _trigger.set()
+            self._respond(200)
+        else:
+            self._respond(404)
+
+    def do_GET(self):
+        if self.path == "/health":
+            self._respond(200)
+        else:
+            self._respond(404)
+
+    def _respond(self, status: int):
+        self.send_response(status)
+        self.end_headers()
+
+    def log_message(self, fmt, *args):
+        pass
+
+
+def _start_webhook_server() -> None:
+    server = http.server.HTTPServer(("127.0.0.1", WEBHOOK_PORT), _WebhookHandler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    log(f"Webhook-Server läuft auf Port {WEBHOOK_PORT}")
 
 
 def main() -> None:
@@ -829,13 +1120,16 @@ def main() -> None:
         run_once()
         return
 
+    _start_webhook_server()
+    _trigger.set()  # sofort beim Start einmal laufen
     while True:
+        _trigger.wait(timeout=120)
+        _trigger.clear()
         try:
             run_once()
         except Exception as exc:
             log(f"Run failed: {exc}")
             print(f"Run failed: {exc}", file=sys.stderr)
-        time.sleep(120)
 
 
 if __name__ == "__main__":
