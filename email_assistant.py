@@ -981,8 +981,11 @@ def process_slack_cmd_approvals(
                 continue
             raise
 
-        if messages:
-            command = slack_reaction_command(messages[0], allowed_user)
+        # Reaktionen auf die letzte Bot-Nachricht im Thread prüfen
+        bot_messages = [m for m in messages if m.get("bot_id")]
+        check_msg = bot_messages[-1] if bot_messages else (messages[0] if messages else None)
+        if check_msg:
+            command = slack_reaction_command(check_msg, allowed_user)
             if command:
                 _handle_cmd_reply(service, token, config, record, command, thread_ts, channel)
                 continue
@@ -998,6 +1001,19 @@ def process_slack_cmd_approvals(
             text = normalize_slack_text(reply.get("text", ""))
             record["last_reply_ts"] = reply["ts"]
             _handle_cmd_reply(service, token, config, record, text, thread_ts, channel)
+            if record.get("status") != "pending":
+                break
+
+
+_EMOJI_TEXT_COMMANDS: dict[str, str] = {
+    ":white_check_mark:": "senden",
+    ":heavy_check_mark:": "senden",
+    ":outbox_tray:": "senden",
+    ":x:": "ablehnen",
+    ":no_entry_sign:": "ablehnen",
+    ":memo:": "entwurf",
+    ":pencil:": "entwurf",
+}
 
 
 def _handle_cmd_reply(
@@ -1009,7 +1025,8 @@ def _handle_cmd_reply(
     thread_ts: str,
     channel: str,
 ) -> None:
-    command = text.lower().strip()
+    normalized = text.lower().strip()
+    command = _EMOJI_TEXT_COMMANDS.get(normalized, normalized)
     to_addr = record.get("to", "")
     subject = record.get("subject", "")
     draft = record.get("draft", "")
