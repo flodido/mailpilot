@@ -144,6 +144,7 @@ def single_instance() -> Any:
             fcntl.flock(lock_file, fcntl.LOCK_UN)
         finally:
             lock_file.close()
+            LOCK_PATH.unlink(missing_ok=True)
 
 
 def load_config() -> dict[str, Any]:
@@ -649,6 +650,17 @@ def strip_meta_trailer(draft: str, signature: str) -> str:
 
 TO_TAG_RE = re.compile(r"<to>(.*?)</to>", re.DOTALL | re.IGNORECASE)
 SUBJECT_TAG_RE = re.compile(r"<subject>(.*?)</subject>", re.DOTALL | re.IGNORECASE)
+_PLACEHOLDER_TO_RE = re.compile(r"^[A-Z][A-Z0-9_]*@[A-Z0-9_]+\.[A-Z]+$")
+
+
+def _is_placeholder_email(addr: str) -> bool:
+    if not addr:
+        return True
+    if _PLACEHOLDER_TO_RE.match(addr):
+        return True
+    if addr.lower() in ("empfaenger@email.de", "name@example.com", "empfaenger@domain.de"):
+        return True
+    return False
 
 
 def claude_draft_new_email(
@@ -667,13 +679,15 @@ Du bist die KI-Assistenz von {owner_name} und schreibst eine neue ausgehende E-M
 
 Harte Regeln:
 - Antworte ausschließlich in diesem Format, keine weiteren Erklärungen:
-<to>empfaenger@email.de</to>
+<to>echte.empfaenger@adresse.de</to>
 <subject>Betreff der E-Mail</subject>
 <email_body>
 E-Mail-Inhalt hier
 
 {signature}
 </email_body>
+- Wenn die Empfänger-E-Mail-Adresse in der Anweisung nicht angegeben ist, lass das <to>-Tag LEER: <to></to>
+- Erfinde keine E-Mail-Adressen.
 - Erfinde keine Fakten, Termine, Preise oder Zusagen.
 - Schreibe in der Sprache, die der Anweisung entspricht.
 
@@ -711,8 +725,11 @@ Erstelle eine neue Version im selben Format.
     to_match = TO_TAG_RE.search(output)
     subject_match = SUBJECT_TAG_RE.search(output)
     body_match = EMAIL_BODY_TAG_RE.search(output)
+    to_val = to_match.group(1).strip() if to_match else ""
+    if _is_placeholder_email(to_val):
+        to_val = ""
     return {
-        "to": to_match.group(1).strip() if to_match else "",
+        "to": to_val,
         "subject": subject_match.group(1).strip() if subject_match else "",
         "body": body_match.group(1).strip() if body_match else output,
     }
@@ -952,8 +969,19 @@ def process_slack_commands(
 
             if not to_addr:
                 slack_post(token, channel,
-                    "Ich konnte keinen Empfänger erkennen. Bitte gib eine E-Mail-Adresse an.", ts)
-                commands[ts] = {"status": "error", "error": "no_recipient", "created_at": time.time()}
+                    "Ich konnte keinen Empfänger erkennen. Antworte im Thread mit der E-Mail-Adresse.", ts)
+                commands[ts] = {
+                    "status": "pending",
+                    "slack_ts": ts,
+                    "slack_channel_id": channel,
+                    "to": "",
+                    "subject": subject,
+                    "draft": draft,
+                    "original_instruction": text,
+                    "last_reply_ts": ts,
+                    "created_at": time.time(),
+                }
+                log(f"Slack-Befehl {ts}: Empfänger fehlt, warte auf Thread-Antwort.")
                 continue
 
             slack_post(
@@ -970,6 +998,7 @@ def process_slack_commands(
                 "to": to_addr,
                 "subject": subject,
                 "draft": draft,
+                "original_instruction": text,
                 "last_reply_ts": ts,
                 "created_at": time.time(),
             }
@@ -992,7 +1021,8 @@ def process_slack_cmd_approvals(
     commands = state.get("slack_cmd", {})
 
     for cmd_ts, record in list(commands.items()):
-        if record.get("status") != "pending":
+        status = record.get("status")
+        if status not in ("pending", "sent", "drafted"):
             continue
         thread_ts = record.get("slack_ts")
         channel = record.get("slack_channel_id") or config["slack_channel_id"]
@@ -1006,7 +1036,44 @@ def process_slack_cmd_approvals(
                 continue
             raise
 
-        # Reaktionen auf die letzte Bot-Nachricht im Thread prüfen
+        last_seen = float(record.get("last_reply_ts") or thread_ts)
+        new_user_replies = [
+            msg for msg in messages
+            if msg.get("user") == allowed_user
+            and not msg.get("bot_id")
+            and float(msg.get("ts", "0")) > last_seen
+        ]
+
+        # Nach dem Senden: neue User-Replies starten einen neuen Entwurf
+        if status in ("sent", "drafted"):
+            for reply in sorted(new_user_replies, key=lambda m: float(m["ts"])):
+                text = normalize_slack_text(reply.get("text", ""))
+                record["last_reply_ts"] = reply["ts"]
+                if text and not _EMOJI_TEXT_COMMANDS.get(text.lower().strip()):
+                    record["status"] = "pending"
+                    record["original_instruction"] = text
+                    prev = {"to": record.get("to",""), "subject": record.get("subject",""), "body": record.get("draft","")}
+                    result = claude_draft_new_email(config, text, previous_draft=prev)
+                    new_to = result["to"] or (record.get("to","") if not _is_placeholder_email(record.get("to","")) else "")
+                    record["to"] = new_to
+                    record["subject"] = result["subject"] or record.get("subject","")
+                    record["draft"] = result["body"]
+                    if not new_to:
+                        slack_post(token, channel,
+                            "Ich konnte keinen Empfänger erkennen. Antworte im Thread mit der E-Mail-Adresse.",
+                            thread_ts)
+                    else:
+                        slack_post(
+                            token, channel,
+                            f"Neuer Entwurf:\n*An:* `{record['to']}`\n*Betreff:* {record['subject']}\n\n```{record['draft']}```\n\n"
+                            f"Reagiere mit :white_check_mark:/:memo:/:x: oder antworte für weitere Änderungen.",
+                            thread_ts,
+                        )
+                    log(f"Folge-Befehl in Thread {thread_ts}: neuer Entwurf für {record['to'] or '(unbekannt)'}.")
+                    break
+            continue
+
+        # Pending: Reaktionen + Text-Replies verarbeiten
         bot_messages = [m for m in messages if m.get("bot_id")]
         check_msg = bot_messages[-1] if bot_messages else (messages[0] if messages else None)
         if check_msg:
@@ -1015,14 +1082,7 @@ def process_slack_cmd_approvals(
                 _handle_cmd_reply(service, token, config, record, command, thread_ts, channel)
                 continue
 
-        last_seen = float(record.get("last_reply_ts") or thread_ts)
-        user_replies = [
-            msg for msg in messages
-            if msg.get("user") == allowed_user
-            and not msg.get("bot_id")
-            and float(msg.get("ts", "0")) > last_seen
-        ]
-        for reply in sorted(user_replies, key=lambda m: float(m["ts"])):
+        for reply in sorted(new_user_replies, key=lambda m: float(m["ts"])):
             text = normalize_slack_text(reply.get("text", ""))
             record["last_reply_ts"] = reply["ts"]
             _handle_cmd_reply(service, token, config, record, text, thread_ts, channel)
@@ -1082,12 +1142,23 @@ def _handle_cmd_reply(
         return
 
     if text:
-        prev = {"to": to_addr, "subject": subject, "body": draft}
-        result = claude_draft_new_email(config, record.get("original_instruction", text),
-                                        previous_draft=prev, refinement=text)
-        record["to"] = result["to"] or to_addr
+        orig = record.get("original_instruction", "")
+        if not draft:
+            # Kein vorheriger Entwurf: kombiniere Original-Anweisung + neue Info für frischen Draft
+            combined = f"{orig}\n{text}".strip() if orig else text
+            result = claude_draft_new_email(config, combined)
+        else:
+            prev = {"to": to_addr, "subject": subject, "body": draft}
+            result = claude_draft_new_email(config, orig or text, previous_draft=prev, refinement=text)
+        new_to = result["to"] or to_addr
+        record["to"] = new_to
         record["subject"] = result["subject"] or subject
         record["draft"] = result["body"]
+        if not new_to:
+            slack_post(token, channel,
+                "Ich konnte die Adresse immer noch nicht erkennen. Bitte antworte mit der vollständigen E-Mail-Adresse.",
+                thread_ts)
+            return
         slack_post(
             token, channel,
             f"Neue Version:\n*An:* `{record['to']}`\n*Betreff:* {record['subject']}\n\n"
