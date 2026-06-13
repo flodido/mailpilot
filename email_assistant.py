@@ -99,8 +99,33 @@ def save_json(path: Path, value: Any) -> None:
     tmp.replace(path)
 
 
+def _release_stale_lock() -> None:
+    """Entfernt Lock-Datei wenn der eingetragene Prozess nicht mehr läuft oder der Lock zu alt ist."""
+    if not LOCK_PATH.exists():
+        return
+    try:
+        age = time.time() - LOCK_PATH.stat().st_mtime
+        pid_str = LOCK_PATH.read_text().strip()
+        if pid_str.isdigit():
+            try:
+                os.kill(int(pid_str), 0)
+                # Prozess lebt — nur freigeben wenn Lock sehr alt ist (> 5 Min)
+                if age < 300:
+                    return
+            except ProcessLookupError:
+                pass  # Prozess tot → Lock ist stale, unabhängig vom Alter
+        else:
+            if age < 300:
+                return
+        log(f"Stale Lock entfernt (Alter {age:.0f}s, PID {pid_str!r})")
+        LOCK_PATH.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 @contextmanager
 def single_instance() -> Any:
+    _release_stale_lock()
     lock_file = LOCK_PATH.open("w", encoding="utf-8")
     try:
         try:
@@ -165,7 +190,7 @@ def slack_api(token: str, method: str, payload: dict[str, Any] | None = None) ->
         headers["Content-Type"] = "application/json; charset=utf-8"
     request = urllib.request.Request(url, data=data, headers=headers, method="POST" if payload else "GET")
     try:
-        with urllib.request.urlopen(request, timeout=30) as response:
+        with urllib.request.urlopen(request, timeout=15) as response:
             result = json.loads(response.read().decode("utf-8"))
     except urllib.error.URLError as exc:
         raise RuntimeError(f"Slack API request failed: {method}: {exc}") from exc
@@ -181,7 +206,7 @@ def slack_history(token: str, channel: str, limit: int = 15, oldest: str | None 
     query = urllib.parse.urlencode(params)
     url = f"https://slack.com/api/conversations.history?{query}"
     request = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
-    with urllib.request.urlopen(request, timeout=30) as response:
+    with urllib.request.urlopen(request, timeout=15) as response:
         result = json.loads(response.read().decode("utf-8"))
     if not result.get("ok"):
         raise RuntimeError(f"Slack API error in conversations.history: {result}")
@@ -192,7 +217,7 @@ def slack_replies(token: str, channel: str, thread_ts: str) -> list[dict[str, An
     query = urllib.parse.urlencode({"channel": channel, "ts": thread_ts, "limit": 100})
     url = f"https://slack.com/api/conversations.replies?{query}"
     request = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
-    with urllib.request.urlopen(request, timeout=30) as response:
+    with urllib.request.urlopen(request, timeout=15) as response:
         result = json.loads(response.read().decode("utf-8"))
     if not result.get("ok"):
         raise RuntimeError(f"Slack API error in conversations.replies: {result}")
@@ -1076,6 +1101,7 @@ def run_once() -> None:
     with single_instance() as acquired:
         if not acquired:
             return
+        log("Run gestartet")
         config = load_config()
         state = load_json(STATE_PATH, {"messages": {}})
         token = get_slack_token(config)
@@ -1086,6 +1112,7 @@ def run_once() -> None:
         process_slack_commands(service, token, config, state)
         process_slack_cmd_approvals(service, token, config, state)
         save_json(STATE_PATH, state)
+        log("Run abgeschlossen")
 
 
 WEBHOOK_PORT = 9878
@@ -1121,6 +1148,9 @@ def _start_webhook_server() -> None:
 
 
 def main() -> None:
+    import socket
+    socket.setdefaulttimeout(20)  # globaler Timeout für alle Netzwerkverbindungen inkl. httplib2/Gmail
+
     parser = argparse.ArgumentParser(description="MailPilot Gmail-to-Slack email assistant")
     parser.add_argument("--once", action="store_true", help="Run one polling cycle")
     parser.add_argument("--auth-only", action="store_true", help="Only authorize Gmail and write token.json")
