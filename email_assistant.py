@@ -13,6 +13,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -60,6 +61,25 @@ META_START_RE = re.compile(
     r"(?i)^\s*(?:ich\s+schreibe|ich\s+formuliere|hier\s+ist|hier\s+der|antwortentwurf|entwurf|"
     r"kurzer\s+hinweis|hinweis|note|erklärung|erklaerung)\b"
 )
+
+AUDIO_FILE_EXTENSIONS = {".m4a", ".mp3", ".wav", ".ogg", ".oga", ".caf", ".aac", ".webm", ".flac"}
+WHISPER_PYTHON = os.path.expanduser(
+    os.environ.get("SLACK_AUDIO_PYTHON", "~/.checker-papa/venv-mlx/bin/python")
+)
+WHISPER_MODEL = os.environ.get("SLACK_AUDIO_MODELL", "mlx-community/whisper-small-mlx")
+# Dieselbe lokale Whisper-Umgebung wie BrainVaults _CONTROL/slack-audio.py (nichts verlässt den Rechner).
+WHISPER_SCRIPT = r"""
+import sys, numpy as np, mlx_whisper
+pfad, modell, sprache = sys.argv[1], sys.argv[2], sys.argv[3]
+b = open(pfad, "rb").read()
+i = b.find(b"data")
+if i < 0:
+    sys.exit("kein data-Chunk in der WAV-Datei")
+n = int.from_bytes(b[i + 4:i + 8], "little")
+a = np.frombuffer(b[i + 8:i + 8 + n], dtype=np.int16).astype(np.float32) / 32768.0
+r = mlx_whisper.transcribe(a, path_or_hf_repo=modell, language=sprache or None, verbose=False)
+print(r["text"].strip())
+"""
 
 
 @dataclass
@@ -851,12 +871,84 @@ def process_slack_approvals(service: Any, token: str, config: dict[str, Any], st
         for reply in sorted(user_replies, key=lambda msg: float(msg["ts"])):
             text = normalize_slack_text(reply.get("text", ""))
             record["last_reply_ts"] = reply["ts"]
+            if not text:
+                audio_file = find_slack_audio_file(reply)
+                if audio_file:
+                    try:
+                        text = transcribe_slack_audio_reply(token, audio_file)
+                        log(f"Audio-Antwort transkribiert für Gmail message {message_id}: {text!r}")
+                    except Exception as exc:
+                        slack_post(
+                            token,
+                            config["slack_channel_id"],
+                            f"Audio-Nachricht konnte nicht transkribiert werden ({exc}). Bitte als Text antworten.",
+                            thread_ts,
+                        )
+                        log(f"Audio-Transkription fehlgeschlagen für Gmail message {message_id}: {exc}")
+                        continue
             handle_slack_reply(service, token, config, message_id, record, text, thread_ts)
 
 
 def normalize_slack_text(text: str) -> str:
     text = re.sub(r"<mailto:([^|>]+)(?:\|[^>]+)?>", r"\1", text)
     return html.unescape(text).strip()
+
+
+def find_slack_audio_file(message: dict[str, Any]) -> dict[str, Any] | None:
+    for f in message.get("files", []) or []:
+        mimetype = (f.get("mimetype") or "").lower()
+        name = f.get("name") or ""
+        if (
+            f.get("subtype") == "slack_audio"
+            or mimetype.startswith("audio/")
+            or (mimetype == "video/mp4" and name.lower().endswith(".m4a"))
+            or os.path.splitext(name)[1].lower() in AUDIO_FILE_EXTENSIONS
+        ):
+            return f
+    return None
+
+
+def download_slack_file(token: str, file_obj: dict[str, Any], dest_path: str) -> None:
+    url = file_obj.get("url_private_download") or file_obj.get("url_private")
+    if not url:
+        raise RuntimeError("Datei-Objekt ohne Download-Link")
+    request = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
+    with urllib.request.urlopen(request, timeout=60) as response:
+        ctype = (response.headers.get("Content-Type") or "").lower()
+        body = response.read()
+    anfang = body[:512].lstrip().lower()
+    if "text/html" in ctype or anfang.startswith(b"<!doctype html") or anfang.startswith(b"<html"):
+        raise RuntimeError("Slack lieferte eine Anmeldeseite statt der Datei (Scope files:read fehlt?)")
+    with open(dest_path, "wb") as fh:
+        fh.write(body)
+
+
+def transcribe_audio_file(path: str, language: str = "de") -> str:
+    if not os.path.exists(WHISPER_PYTHON):
+        raise RuntimeError(f"Whisper-Umgebung fehlt: {WHISPER_PYTHON}")
+    with tempfile.TemporaryDirectory() as tmp:
+        wav = os.path.join(tmp, "clip.wav")
+        conv = subprocess.run(
+            ["afconvert", "-f", "WAVE", "-d", "LEI16@16000", "-c", "1", path, wav],
+            capture_output=True, text=True,
+        )
+        if conv.returncode != 0 or not os.path.exists(wav):
+            raise RuntimeError(f"afconvert scheiterte: {conv.stderr.strip()[:300]}")
+        lauf = subprocess.run(
+            [WHISPER_PYTHON, "-I", "-c", WHISPER_SCRIPT, wav, WHISPER_MODEL, language],
+            capture_output=True, text=True, timeout=600,
+        )
+        if lauf.returncode != 0:
+            raise RuntimeError(f"Whisper scheiterte: {lauf.stderr.strip()[-400:]}")
+        return lauf.stdout.strip()
+
+
+def transcribe_slack_audio_reply(token: str, file_obj: dict[str, Any]) -> str:
+    name = os.path.basename(file_obj.get("name") or file_obj.get("id") or "clip.m4a")
+    with tempfile.TemporaryDirectory() as tmp:
+        local_path = os.path.join(tmp, name)
+        download_slack_file(token, file_obj, local_path)
+        return transcribe_audio_file(local_path)
 
 
 def handle_slack_reply(
