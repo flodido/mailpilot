@@ -808,6 +808,25 @@ def is_blocked_send(config: dict[str, Any], mail: ForwardedMail, draft: str) -> 
     return None
 
 
+def find_thread_record(state: dict[str, Any], thread_id: str | None) -> tuple[str, dict[str, Any]] | None:
+    if not thread_id:
+        return None
+    for mid, rec in state.get("messages", {}).items():
+        if not rec.get("slack_ts"):
+            continue
+        # gmail_send() setzt keine In-Reply-To/References-Header, Gmail legt die
+        # gesendete Antwort deshalb in einem EIGENEN Thread an, nicht im Thread
+        # der weitergeleiteten Original-Mail. Für künftige Antworten ist also
+        # sent_thread_id (Thread der von uns verschickten Mail) maßgeblich;
+        # gmail_thread_id bleibt als Rückfall für den unwahrscheinlichen Fall,
+        # dass Gmail doch per Betreff zusammenführt.
+        if rec.get("sent_thread_id") == thread_id:
+            return mid, rec
+        if rec.get("mail", {}).get("gmail_thread_id") == thread_id:
+            return mid, rec
+    return None
+
+
 def process_new_gmail(service: Any, token: str, config: dict[str, Any], state: dict[str, Any]) -> None:
     processed = state.setdefault("messages", {})
     query = config.get("gmail_query", "in:inbox is:unread -from:me")
@@ -820,6 +839,27 @@ def process_new_gmail(service: Any, token: str, config: dict[str, Any], state: d
             mail = parse_forwarded_mail(message_id, msg, meta, config)
             if not is_allowed_forwarder(config, mail.forward_from):
                 sender = extract_email_address(mail.forward_from) or mail.forward_from or "unknown"
+                thread_match = find_thread_record(state, meta.get("threadId"))
+                if thread_match:
+                    orig_id, orig_record = thread_match
+                    snippet = (meta.get("snippet") or "").strip()
+                    slack_post(
+                        token,
+                        orig_record.get("slack_channel_id") or config["slack_channel_id"],
+                        f":leftwards_arrow_with_hook: Antwort von `{sender}` eingegangen:\n> {snippet or '(kein Vorschautext)'}",
+                        orig_record.get("slack_ts"),
+                    )
+                    processed[message_id] = {
+                        "status": "reply_notified",
+                        "sender": sender,
+                        "subject": mail.forward_subject,
+                        "related_message_id": orig_id,
+                        "created_at": time.time(),
+                    }
+                    if config.get("mark_unauthorized_read", True):
+                        gmail_mark_read(service, message_id)
+                    log(f"Antwort von {sender} auf Gmail message {orig_id} erkannt, in Slack-Thread gemeldet.")
+                    continue
                 processed[message_id] = {
                     "status": "skipped_unauthorized",
                     "sender": sender,
@@ -996,9 +1036,10 @@ def handle_slack_reply(
             )
             return
         cc = config.get("slack_cmd_cc")
-        gmail_send(service, recipient, subject, draft, cc=cc)
+        send_result = gmail_send(service, recipient, subject, draft, cc=cc)
         record["status"] = "sent"
         record["sent_at"] = time.time()
+        record["sent_thread_id"] = send_result.get("threadId")
         cc_info = f", CC: `{cc}`" if cc else ""
         slack_post(token, config["slack_channel_id"], f"Gesendet an `{recipient}`{cc_info}.", thread_ts)
         log(f"Sent reply for Gmail message {message_id} to {recipient}{cc_info}.")
@@ -1270,9 +1311,10 @@ def _handle_cmd_reply(
 
     if command in {"senden", "send"}:
         cc = config.get("slack_cmd_cc")
-        gmail_send(service, to_addr, subject, draft, cc=cc)
+        send_result = gmail_send(service, to_addr, subject, draft, cc=cc)
         record["status"] = "sent"
         record["sent_at"] = time.time()
+        record["sent_thread_id"] = send_result.get("threadId")
         cc_info = f", CC: `{cc}`" if cc else ""
         slack_post(token, channel, f"Gesendet an `{to_addr}`{cc_info}.", thread_ts)
         log(f"Slack-Befehl: E-Mail gesendet an {to_addr}{cc_info}.")
