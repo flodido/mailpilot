@@ -777,11 +777,20 @@ def post_new_mail_to_slack(token: str, config: dict[str, Any], mail: ForwardedMa
     if not recipient:
         status = "Empfänger unklar, bitte im Thread klären"
 
+    original_snippet = mail.original_body.strip()
+    if len(original_snippet) > 500:
+        original_snippet = original_snippet[:500].rstrip() + " […]"
+    quoted_original = (
+        "\n".join(f"> {line}" for line in original_snippet.splitlines())
+        if original_snippet else "> (kein Text erkannt)"
+    )
+
     text = (
         f":email: Neue Antwort vorbereitet\n"
         f"*Status:* {status}\n"
         f"*Empfänger:* {recipient or mail.original_from or 'unklar'}\n"
         f"*Betreff:* {ensure_reply_subject(mail.original_subject)}\n\n"
+        f"*Original-Mail:*\n{quoted_original}\n\n"
         f"*Vorschlag:*\n```{draft}```\n\n"
         f"Reagiere mit :white_check_mark: zum Senden, :memo: für Gmail-Entwurf, :x: zum Ablehnen. "
         f"Für Verfeinerungen antworte im Thread."
@@ -960,7 +969,8 @@ def handle_slack_reply(
     text: str,
     thread_ts: str,
 ) -> None:
-    command = text.lower().strip()
+    normalized = text.lower().strip()
+    command = _EMOJI_TEXT_COMMANDS.get(normalized, normalized)
     mail = ForwardedMail(**record["mail"])
     recipient = record.get("recipient") or extract_email_address(mail.original_from)
     subject = record.get("subject") or mail.original_subject
@@ -981,11 +991,13 @@ def handle_slack_reply(
                 thread_ts,
             )
             return
-        gmail_send(service, recipient, subject, draft)
+        cc = config.get("slack_cmd_cc")
+        gmail_send(service, recipient, subject, draft, cc=cc)
         record["status"] = "sent"
         record["sent_at"] = time.time()
-        slack_post(token, config["slack_channel_id"], f"Gesendet an `{recipient}`.", thread_ts)
-        log(f"Sent reply for Gmail message {message_id} to {recipient}.")
+        cc_info = f", CC: `{cc}`" if cc else ""
+        slack_post(token, config["slack_channel_id"], f"Gesendet an `{recipient}`{cc_info}.", thread_ts)
+        log(f"Sent reply for Gmail message {message_id} to {recipient}{cc_info}.")
         return
 
     if command in {"entwurf", "draft"}:
