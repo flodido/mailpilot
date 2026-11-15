@@ -1062,6 +1062,22 @@ def process_slack_commands(
 
         text = normalize_slack_text(msg.get("text", "")).strip()
         if not text:
+            audio_file = find_slack_audio_file(msg)
+            if audio_file:
+                try:
+                    text = transcribe_slack_audio_reply(token, audio_file)
+                    log(f"Audio-Befehl transkribiert ({ts}): {text!r}")
+                except Exception as exc:
+                    slack_post(
+                        token, channel,
+                        f"Audio-Nachricht konnte nicht transkribiert werden ({exc}). Bitte als Text schreiben.",
+                        ts,
+                    )
+                    commands[ts] = {"status": "error", "error": str(exc), "created_at": time.time()}
+                    newest_ts = ts
+                    log(f"Audio-Transkription fehlgeschlagen für Slack-Befehl {ts}: {exc}")
+                    continue
+        if not text:
             continue
 
         newest_ts = ts
@@ -1153,6 +1169,20 @@ def process_slack_cmd_approvals(
             for reply in sorted(new_user_replies, key=lambda m: float(m["ts"])):
                 text = normalize_slack_text(reply.get("text", ""))
                 record["last_reply_ts"] = reply["ts"]
+                if not text:
+                    audio_file = find_slack_audio_file(reply)
+                    if audio_file:
+                        try:
+                            text = transcribe_slack_audio_reply(token, audio_file)
+                            log(f"Audio-Antwort transkribiert (Folge-Befehl {thread_ts}): {text!r}")
+                        except Exception as exc:
+                            slack_post(
+                                token, channel,
+                                f"Audio-Nachricht konnte nicht transkribiert werden ({exc}). Bitte als Text antworten.",
+                                thread_ts,
+                            )
+                            log(f"Audio-Transkription fehlgeschlagen für Folge-Befehl {thread_ts}: {exc}")
+                            continue
                 if text and not _EMOJI_TEXT_COMMANDS.get(text.lower().strip()):
                     record["status"] = "pending"
                     record["original_instruction"] = text
@@ -1189,6 +1219,20 @@ def process_slack_cmd_approvals(
         for reply in sorted(new_user_replies, key=lambda m: float(m["ts"])):
             text = normalize_slack_text(reply.get("text", ""))
             record["last_reply_ts"] = reply["ts"]
+            if not text:
+                audio_file = find_slack_audio_file(reply)
+                if audio_file:
+                    try:
+                        text = transcribe_slack_audio_reply(token, audio_file)
+                        log(f"Audio-Antwort transkribiert (Befehl {thread_ts}): {text!r}")
+                    except Exception as exc:
+                        slack_post(
+                            token, channel,
+                            f"Audio-Nachricht konnte nicht transkribiert werden ({exc}). Bitte als Text antworten.",
+                            thread_ts,
+                        )
+                        log(f"Audio-Transkription fehlgeschlagen für Befehl {thread_ts}: {exc}")
+                        continue
             _handle_cmd_reply(service, token, config, record, text, thread_ts, channel)
             if record.get("status") != "pending":
                 break
