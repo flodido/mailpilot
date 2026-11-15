@@ -40,13 +40,15 @@ INSTRUCTION_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 FORWARD_MARKER_RE = re.compile(
-    r"(?im)^[-\s]*(?:forwarded message|weitergeleitete nachricht|urspruengliche nachricht|original message)[-\s]*$"
+    r"(?im)^[>\s]*(?:-{2,}\s*)?(?:(?:begin|anfang\s+der)\s+)?"
+    r"(?:forwarded\s+message|weitergeleitete[n]?\s+nachricht|urspruengliche\s+nachricht|original\s+message)"
+    r"\s*-{0,}\s*:?\s*$"
 )
 HEADER_PATTERNS = {
-    "from": re.compile(r"(?im)^\s*(?:from|von):\s*(.+?)\s*$"),
-    "subject": re.compile(r"(?im)^\s*(?:subject|betreff):\s*(.+?)\s*$"),
-    "date": re.compile(r"(?im)^\s*(?:date|datum|sent|gesendet):\s*(.+?)\s*$"),
-    "to": re.compile(r"(?im)^\s*(?:to|an):\s*(.+?)\s*$"),
+    "from": re.compile(r"(?im)^[>\s]*(?:from|von):\s*(.+?)\s*$"),
+    "subject": re.compile(r"(?im)^[>\s]*(?:subject|betreff):\s*(.+?)\s*$"),
+    "date": re.compile(r"(?im)^[>\s]*(?:date|datum|sent|gesendet):\s*(.+?)\s*$"),
+    "to": re.compile(r"(?im)^[>\s]*(?:to|an):\s*(.+?)\s*$"),
 }
 EMAIL_BODY_TAG_RE = re.compile(r"(?is)<email_body>\s*(.*?)\s*</email_body>")
 CODE_FENCE_RE = re.compile(r"(?is)^\s*```(?:text|markdown|email)?\s*(.*?)\s*```\s*$")
@@ -863,8 +865,10 @@ def process_slack_approvals(service: Any, token: str, config: dict[str, Any], st
                 log(f"Slack thread not found for Gmail message {message_id} in channel {channel}. Skipping approval check.")
                 continue
             raise
-        if messages:
-            command = slack_reaction_command(messages[0], allowed_user)
+        bot_messages = [m for m in messages if m.get("bot_id")]
+        check_msg = bot_messages[-1] if bot_messages else (messages[0] if messages else None)
+        if check_msg:
+            command = slack_reaction_command(check_msg, allowed_user)
             if command:
                 record["last_reply_ts"] = max(record.get("last_reply_ts") or thread_ts, thread_ts)
                 handle_slack_reply(service, token, config, message_id, record, command, thread_ts)
